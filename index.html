@@ -95,12 +95,17 @@ dialog h3{margin:0 0 14px}
 <body>
 <header class="top"><div class="top-in">
   <div><h1 id="title">Trip Organiser</h1><div class="sub" id="sub"></div></div>
-  <button class="chip" id="cd" title="Trip settings"></button>
+  <div style="display:flex;flex-direction:column;gap:6px;align-items:flex-end">
+    <button class="chip" id="cd" title="Trip settings"></button>
+    <button class="chip" id="sy" hidden></button>
+  </div>
 </div></header>
 <nav class="tabs" id="tabs"></nav>
 <main id="view"></main>
 <dialog id="dlg"></dialog>
 
+<script src="config.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.js"></script>
 <script>
 "use strict";
 /* ---------- helpers ---------- */
@@ -110,6 +115,9 @@ const uid = () => Math.random().toString(36).slice(2, 9) + Date.now().toString(3
 const today = () => new Date().toISOString().slice(0, 10);
 const nf0 = new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 });
 const nf2 = new Intl.NumberFormat("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const inr = new Intl.NumberFormat("en-IN", { maximumFractionDigits: 2 });
+const fmtCur = (c, n) => c === "INR" ? "₹" + inr.format(n) : nf2.format(n) + " " + c;
+const fmtHome = n => fmtCur(S.settings.homeCur, n);
 const fmtDate = (d, o = { weekday: "short", day: "numeric", month: "short" }) =>
   d ? new Date(d + "T00:00").toLocaleDateString("en-GB", o) : "";
 function toast(msg) {
@@ -120,13 +128,14 @@ function toast(msg) {
 /* ---------- state ---------- */
 const KEY = "trip-organiser-v1";
 const DEFAULT = {
-  settings: { name: "Vietnam Trip", start: "", end: "", p1: "Me", p2: "Wife", homeCur: "USD", rate: 25000, budget: 0 },
-  itinerary: [], expenses: [], todos: [], packing: [], seeded: false
+  settings: { name: "Vietnam Trip", start: "", end: "", p1: "Me", p2: "Wife", homeCur: "INR", rate: 290, budget: 0 },
+  itinerary: [], expenses: [], todos: [], packing: [], seeded: false, hashes: {}, tomb: {}, dirty: {}
 };
 let S;
 try { S = JSON.parse(localStorage.getItem(KEY)) || structuredClone(DEFAULT); } catch { S = structuredClone(DEFAULT); }
 S = { ...structuredClone(DEFAULT), ...S, settings: { ...DEFAULT.settings, ...(S.settings || {}) } };
-const save = () => { try { localStorage.setItem(KEY, JSON.stringify(S)); } catch { toast("Could not save (storage full?)"); } };
+const persist = () => { try { localStorage.setItem(KEY, JSON.stringify(S)); } catch { toast("Could not save (storage full?)"); } };
+const save = () => { track(); persist(); schedulePush(); };
 const person = k => k === "p1" ? S.settings.p1 : k === "p2" ? S.settings.p2 : "Both";
 
 /* ---------- documents (IndexedDB, device-only) ---------- */
@@ -142,6 +151,178 @@ const DB = (() => {
     t.oncomplete = () => res(rq && rq.result); t.onerror = () => rej(t.error); }); };
   return { all: () => tx("readonly", s => s.getAll()), put: d => tx("readwrite", s => s.put(d)), del: id => tx("readwrite", s => s.delete(id)) };
 })();
+
+/* ---------- change tracking (for cloud sync) ---------- */
+const stable = v => v && typeof v === "object"
+  ? (Array.isArray(v) ? "[" + v.map(stable).join(",") + "]" : "{" + Object.keys(v).sort().map(k => JSON.stringify(k) + ":" + stable(v[k])).join(",") + "}")
+  : JSON.stringify(v);
+const hashOf = o => { const { u, ...rest } = o; return stable(rest); };
+const COLS = ["itinerary", "expenses", "todos", "packing"];
+const DEF_H = hashOf(DEFAULT.settings);
+function track() {
+  const now = Date.now(), seen = new Set();
+  const visit = (id, k, obj) => {
+    seen.add(id);
+    const h = hashOf(obj), prev = S.hashes[id];
+    if (prev && prev.h === h) return;
+    S.hashes[id] = { h, k };
+    if (k === "settings" && !prev && h === DEF_H) { obj.u = 0; return; }
+    obj.u = now; S.dirty[id] = k; delete S.tomb[id];
+  };
+  visit("settings", "settings", S.settings);
+  COLS.forEach(k => S[k].forEach(it => visit(it.id, k, it)));
+  Object.keys(S.hashes).forEach(id => {
+    if (!seen.has(id)) { const k = S.hashes[id].k; S.tomb[id] = { k, u: now }; S.dirty[id] = k; delete S.hashes[id]; }
+  });
+}
+track(); persist();
+
+/* ---------- cloud sync (Supabase) ---------- */
+const CFG = window.TRIP_CONFIG || {};
+let sb = null;
+try { if (CFG.supabaseUrl && CFG.supabaseKey && window.supabase) sb = supabase.createClient(CFG.supabaseUrl, CFG.supabaseKey); } catch { sb = null; }
+const cloud = { user: null, state: sb ? "signedout" : "off" };
+let syncing = false, again = false, timer, live = false;
+const curU = id => id === "settings" ? (S.settings.u || 0)
+  : S.tomb[id] ? S.tomb[id].u
+  : (COLS.map(k => S[k].find(x => x.id === id)).find(Boolean) || {}).u;
+function setState(s) { cloud.state = s; cloudChip(); }
+function cloudChip() {
+  const el = $("#sy"); if (!el) return;
+  if (!sb) { el.hidden = true; return; }
+  el.hidden = false;
+  el.textContent = { signedout: "☁ Sign in", syncing: "☁ Syncing…", ok: "☁ Synced", error: "⚠ Sync error", offline: "☁ Offline" }[cloud.state] || "☁";
+  el.onclick = cloudDialog;
+}
+function schedulePush() { if (!sb || !cloud.user) return; clearTimeout(timer); timer = setTimeout(sync, 700); }
+function applyRemote(r) {
+  if (r.kind === "settings") {
+    if (!r.deleted) { S.settings = { ...DEFAULT.settings, ...r.data }; S.hashes.settings = { h: hashOf(S.settings), k: "settings" }; }
+    return;
+  }
+  const col = S[r.kind]; if (!COLS.includes(r.kind)) return;
+  const i = col.findIndex(x => x.id === r.id);
+  if (r.deleted) { if (i >= 0) col.splice(i, 1); delete S.hashes[r.id]; S.tomb[r.id] = { k: r.kind, u: r.u }; }
+  else { delete S.tomb[r.id]; if (i >= 0) col[i] = r.data; else col.push(r.data); S.hashes[r.id] = { h: hashOf(r.data), k: r.kind }; }
+}
+async function sync() {
+  if (!sb || !cloud.user) return;
+  if (syncing) { again = true; return; }
+  syncing = true; setState("syncing");
+  try {
+    const { data: rows, error } = await sb.from("items").select("*");
+    if (error) throw error;
+    let changed = false;
+    const remote = new Set(rows.map(r => r.id));
+    // pull plain items (last edit wins per item)
+    for (const r of rows) {
+      if (r.kind === "doc") continue;
+      const lu = curU(r.id);
+      if (lu !== undefined && lu >= r.u) continue;
+      applyRemote(r); delete S.dirty[r.id]; changed = true;
+    }
+    // anything local the server has never seen gets pushed
+    if (S.settings.u && !remote.has("settings")) S.dirty.settings = "settings";
+    COLS.forEach(k => S[k].forEach(it => { if (!remote.has(it.id)) S.dirty[it.id] = k; }));
+    // pull document records (files download on demand)
+    let idb = await DB.all();
+    const have = new Map(idb.map(d => [d.id, d]));
+    for (const r of rows) {
+      if (r.kind !== "doc") continue;
+      const t = S.tomb[r.id]; if (t && t.u >= r.u) continue;
+      if (r.deleted) { if (have.has(r.id)) { await DB.del(r.id); changed = true; } continue; }
+      if (!have.has(r.id)) { await DB.put({ ...r.data, blob: null, synced: true }); changed = true; }
+    }
+    idb.forEach(d => { if (d.blob && d.synced !== true && !remote.has(d.id)) S.dirty[d.id] = "doc"; });
+    // push plain items
+    const up = [];
+    for (const [id, k] of Object.entries(S.dirty)) {
+      if (k === "doc") continue;
+      const t = S.tomb[id];
+      if (t) up.push({ id, kind: k, data: {}, deleted: true, u: t.u });
+      else { const it = k === "settings" ? S.settings : S[k].find(x => x.id === id); if (it) up.push({ id, kind: k, data: it, deleted: false, u: it.u || 0 }); else delete S.dirty[id]; }
+    }
+    if (up.length) {
+      const { error: e2 } = await sb.from("items").upsert(up);
+      if (e2) throw e2;
+      up.forEach(r => { if (curU(r.id) === r.u || r.deleted) delete S.dirty[r.id]; });
+    }
+    // push documents
+    for (const [id, k] of Object.entries(S.dirty)) {
+      if (k !== "doc") continue;
+      const t = S.tomb[id];
+      if (t) {
+        await sb.storage.from("docs").remove([id]);
+        const { error: e3 } = await sb.from("items").upsert({ id, kind: "doc", data: {}, deleted: true, u: t.u });
+        if (e3) throw e3; delete S.dirty[id]; continue;
+      }
+      const m = (await DB.all()).find(x => x.id === id);
+      if (!m || !m.blob) { delete S.dirty[id]; continue; }
+      const f = await sb.storage.from("docs").upload(id, m.blob, { upsert: true, contentType: m.type });
+      if (f.error) throw f.error;
+      const meta = { id, name: m.name, type: m.type, size: m.size, cat: m.cat, who: m.who, added: m.added };
+      const { error: e4 } = await sb.from("items").upsert({ id, kind: "doc", data: meta, deleted: false, u: Date.now() });
+      if (e4) throw e4;
+      await DB.put({ ...m, synced: true }); delete S.dirty[id]; changed = true;
+    }
+    persist(); setState("ok");
+    if (changed) { if (!$("#dlg").open && !/INPUT|SELECT|TEXTAREA/.test(document.activeElement?.tagName || "")) render(); else header(); }
+  } catch (e) {
+    console.error("sync failed", e);
+    setState(navigator.onLine ? "error" : "offline");
+  } finally {
+    syncing = false;
+    if (again) { again = false; sync(); }
+  }
+}
+async function fetchDoc(id) {
+  if (!sb) throw new Error("no cloud");
+  const { data, error } = await sb.storage.from("docs").download(id);
+  if (error) throw error;
+  const d = (await DB.all()).find(x => x.id === id);
+  if (d) await DB.put({ ...d, blob: data });
+  return data;
+}
+function startSync() {
+  sync();
+  if (live) return; live = true;
+  sb.channel("items-live").on("postgres_changes", { event: "*", schema: "public", table: "items" }, () => sync()).subscribe();
+}
+async function initCloud() {
+  if (!sb) return;
+  const { data } = await sb.auth.getSession();
+  cloud.user = data.session?.user || null;
+  sb.auth.onAuthStateChange((_e, sess) => {
+    const was = cloud.user; cloud.user = sess?.user || null;
+    if (cloud.user && !was) setTimeout(startSync, 0);
+    if (!cloud.user) setState("signedout");
+  });
+  addEventListener("online", () => sync());
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) sync(); });
+  if (cloud.user) startSync();
+  else { setState("signedout"); if (!localStorage.getItem(KEY + "-welcomed")) { try { localStorage.setItem(KEY + "-welcomed", "1"); } catch {} cloudDialog(); } }
+}
+function cloudDialog() {
+  const dlg = $("#dlg");
+  if (cloud.user) {
+    dlg.innerHTML = `<h3>Cloud sync</h3><p class="muted small">Signed in as <b>${esc(cloud.user.email)}</b>.<br>Changes sync automatically to everyone signed in to this trip.</p>
+      <div class="row" style="flex-wrap:wrap"><button class="btn" id="sn">Sync now</button><button class="btn ghost" id="so">Sign out</button><button class="btn ghost" id="cl">Close</button></div>`;
+    $("#sn", dlg).onclick = () => { dlg.close(); sync(); };
+    $("#so", dlg).onclick = async () => { await sb.auth.signOut(); dlg.close(); toast("Signed out — data stays on this device"); };
+  } else {
+    dlg.innerHTML = `<form method="dialog"><h3>Sign in to sync</h3><p class="muted small">Use the email and password set up for this trip. Signing in shares your plans between your devices.</p>
+      <label class="f">Email<input name="e" type="email" required autocomplete="username"></label>
+      <label class="f">Password<input name="p" type="password" required autocomplete="current-password"></label>
+      <div class="row between"><button type="button" class="btn ghost" id="cl">Not now</button><button class="btn">Sign in</button></div></form>`;
+    $("form", dlg).onsubmit = async e => {
+      e.preventDefault(); const f = new FormData(e.target);
+      const { error } = await sb.auth.signInWithPassword({ email: f.get("e").trim(), password: f.get("p") });
+      if (error) toast("Sign-in failed: " + error.message); else { dlg.close(); toast("Signed in"); }
+    };
+  }
+  $("#cl", dlg).onclick = () => dlg.close();
+  dlg.showModal();
+}
 
 /* ---------- form dialog ---------- */
 function openForm(title, fields, init, onSave, extra) {
@@ -184,6 +365,7 @@ function header() {
   const d = daysTo(s.start);
   $("#cd").textContent = d == null ? "⚙ Settings" : d > 0 ? `✈️ ${d} day${d === 1 ? "" : "s"} to go` : d === 0 ? "✈️ Today!" : "🌴 On trip";
   $("#cd").onclick = openSettings;
+  cloudChip();
 }
 const daysTo = d => d ? Math.ceil((new Date(d + "T00:00") - new Date()) / 864e5) : null;
 
@@ -216,7 +398,8 @@ function backupDialog() {
   $("#im", dlg).onchange = async e => {
     try { const j = JSON.parse(await e.target.files[0].text());
       if (!confirm("Replace everything in this browser with the backup?")) return;
-      S = { ...structuredClone(DEFAULT), ...j }; save(); dlg.close(); render(); toast("Backup restored");
+      S = { ...structuredClone(DEFAULT), ...j, hashes: {}, tomb: {}, dirty: {} }; S.settings = { ...DEFAULT.settings, ...S.settings };
+      save(); dlg.close(); render(); toast("Backup restored");
     } catch { toast("That file isn't a valid backup"); }
   };
   dlg.showModal();
@@ -249,7 +432,7 @@ function vOverview(el) {
   el.innerHTML = `
   <div class="grid" style="margin-bottom:14px">
     <div class="stat"><div class="k">Countdown</div><div class="v">${d == null ? "—" : d > 0 ? d + " days" : d === 0 ? "Today" : "Travelling"}</div><div class="s">${s.start ? fmtDate(s.start) : "set dates in ⚙"}</div></div>
-    <div class="stat"><div class="k">Spent</div><div class="v">${nf0.format(spent)} ₫</div><div class="s">≈ ${nf2.format(spent / s.rate)} ${esc(s.homeCur)}</div></div>
+    <div class="stat"><div class="k">Spent</div><div class="v">${nf0.format(spent)} ₫</div><div class="s">≈ ${esc(fmtHome(spent / s.rate))}</div></div>
     <div class="stat"><div class="k">To-do left</div><div class="v">${openTodos}</div><div class="s">${S.todos.length} total</div></div>
     <div class="stat"><div class="k">Packed</div><div class="v">${packed}/${S.packing.length}</div><div class="s">items</div></div>
   </div>
@@ -305,24 +488,36 @@ async function vDocs(el) {
     <label class="btn" style="display:block;text-align:center;cursor:pointer">+ Add files / photos<input id="dfile" type="file" multiple hidden accept="image/*,application/pdf,.doc,.docx,.txt"></label></div>
   <div class="card"><div class="pills">${["All", ...DOC_CATS].map(c => `<button class="pill ${c === docFilter ? "on" : ""}" data-f="${c}">${c}${c === "All" ? ` (${docs.length})` : ""}</button>`).join("")}</div>
   ${shown.length ? shown.map(d => `<div class="item"><div class="thumb" data-th="${d.id}">${d.type.startsWith("image/") ? "🖼" : d.type === "application/pdf" ? "📕" : "📎"}</div>
-    <div class="grow"><div class="t">${esc(d.name)}</div><div class="muted small"><span class="tag">${esc(d.cat)}</span><span class="tag w">${esc(person(d.who))}</span>${(d.size / 1024).toFixed(0)} KB</div></div>
+    <div class="grow"><div class="t">${esc(d.name)}</div><div class="muted small"><span class="tag">${esc(d.cat)}</span><span class="tag w">${esc(person(d.who))}</span>${(d.size / 1024).toFixed(0)} KB${d.blob ? "" : " · ☁ tap ↗ to download"}</div></div>
     <button class="icon-btn" data-o="${d.id}" title="Open">↗</button><button class="icon-btn" data-x="${d.id}" title="Delete">🗑</button></div>`).join("") : `<div class="empty">Nothing here yet.<br>Add passport scans, e-visa, flight tickets and hotel bookings so they're offline when you need them.</div>`}</div>`;
   const map = new Map(docs.map(d => [d.id, d]));
-  shown.filter(d => d.type.startsWith("image/")).forEach(d => {
+  shown.filter(d => d.blob && d.type.startsWith("image/")).forEach(d => {
     const th = $(`[data-th="${d.id}"]`); if (th) th.innerHTML = `<img alt="" src="${URL.createObjectURL(d.blob)}">`;
   });
   $("#dfile").onchange = async e => {
     for (const f of e.target.files) {
-      try { await DB.put({ id: uid(), name: f.name, type: f.type || "application/octet-stream", size: f.size, cat: $("#dcat").value, who: $("#dwho").value, added: Date.now(), blob: f }); }
+      try { const id = uid(); await DB.put({ id, name: f.name, type: f.type || "application/octet-stream", size: f.size, cat: $("#dcat").value, who: $("#dwho").value, added: Date.now(), blob: f, synced: false }); S.dirty[id] = "doc"; }
       catch { toast("Couldn't save " + f.name); }
     }
-    toast("Saved"); render();
+    persist(); schedulePush(); toast("Saved"); render();
   };
   el.onclick = async e => {
     const f = e.target.closest("[data-f]"), o = e.target.closest("[data-o]"), x = e.target.closest("[data-x]");
     if (f) { docFilter = f.dataset.f; render(); }
-    if (o) { const d = map.get(o.dataset.o); window.open(URL.createObjectURL(d.blob), "_blank"); }
-    if (x && confirm("Delete this document from this device?")) { await DB.del(x.dataset.x); render(); }
+    if (o) {
+      const d = map.get(o.dataset.o);
+      if (d.blob) window.open(URL.createObjectURL(d.blob), "_blank");
+      else {
+        const w = window.open("", "_blank");
+        try { const blob = await fetchDoc(d.id); w.location = URL.createObjectURL(blob); render(); }
+        catch { if (w) w.close(); toast("Couldn't download — are you online and signed in?"); }
+      }
+    }
+    if (x && confirm(sb ? "Delete this document for everyone?" : "Delete this document from this device?")) {
+      const id = x.dataset.x; await DB.del(id);
+      if (sb) { S.tomb[id] = { k: "doc", u: Date.now() }; S.dirty[id] = "doc"; persist(); schedulePush(); }
+      render();
+    }
   };
 }
 
@@ -333,7 +528,7 @@ let expFilter = "All";
 const expFields = () => [
   { k: "title", label: "What", req: 1, ph: "Pho & coffee" },
   { k: "amount", label: "Amount", type: "number", req: 1, half: 1 },
-  { k: "cur", label: "Currency", type: "select", half: 1, opts: [["VND", "VND ₫"], [S.settings.homeCur, S.settings.homeCur]] },
+  { k: "cur", label: "Currency", type: "select", half: 1, opts: [["VND", "VND ₫"], [S.settings.homeCur, S.settings.homeCur + (S.settings.homeCur === "INR" ? " ₹" : "")]] },
   { k: "date", label: "Date", type: "date", half: 1, def: today() },
   { k: "cat", label: "Category", type: "select", half: 1, opts: EXP_CATS.map(c => [c, c]) },
   { k: "paidBy", label: "Paid by", type: "select", half: 1, opts: [["p1", S.settings.p1], ["p2", S.settings.p2]] },
@@ -346,7 +541,7 @@ function vExpenses(el) {
   const max = Math.max(1, ...Object.values(by));
   const paid1 = S.expenses.filter(e => e.paidBy === "p1").reduce((a, e) => a + toVND(e), 0);
   el.innerHTML = `<div class="grid" style="margin-bottom:14px">
-    <div class="stat"><div class="k">Total</div><div class="v">${nf0.format(total)} ₫</div><div class="s">≈ ${nf2.format(total / S.settings.rate)} ${esc(S.settings.homeCur)}</div></div>
+    <div class="stat"><div class="k">Total</div><div class="v">${nf0.format(total)} ₫</div><div class="s">≈ ${esc(fmtHome(total / S.settings.rate))}</div></div>
     <div class="stat"><div class="k">Balance</div><div class="v" style="font-size:15px;margin-top:6px">${balanceText()}</div><div class="s">${esc(S.settings.p1)} paid ${nf0.format(paid1)} ₫</div></div></div>
   ${Object.keys(by).length ? `<div class="card"><h2>By category</h2>${Object.entries(by).sort((a, b) => b[1] - a[1]).map(([c, v]) =>
     `<div style="margin-bottom:10px"><div class="row between small"><span>${CAT_ICON[c] || ""} ${esc(c)}</span><span>${nf0.format(v)} ₫</span></div><div class="bar"><i style="width:${v / max * 100}%"></i></div></div>`).join("")}</div>` : ""}
@@ -354,7 +549,7 @@ function vExpenses(el) {
   <div class="pills" style="margin-top:12px">${["All", ...EXP_CATS].map(c => `<button class="pill ${c === expFilter ? "on" : ""}" data-f="${c}">${c}</button>`).join("")}</div>
   ${list.length ? list.map(e => `<div class="item"><div class="thumb">${CAT_ICON[e.cat] || "🧾"}</div><div class="grow"><div class="t">${esc(e.title)}</div>
     <div class="muted small">${fmtDate(e.date)} · paid by ${esc(person(e.paidBy))} · ${e.forWho === "both" ? "split" : "only " + esc(person(e.forWho))}</div></div>
-    <div><div class="amt">${e.cur === "VND" ? nf0.format(e.amount) + " ₫" : nf2.format(e.amount) + " " + esc(e.cur)}</div>${e.cur !== "VND" ? `<div class="muted small amt">${nf0.format(toVND(e))} ₫</div>` : ""}</div>
+    <div><div class="amt">${e.cur === "VND" ? nf0.format(e.amount) + " ₫" : esc(fmtCur(e.cur, e.amount))}</div>${e.cur !== "VND" ? `<div class="muted small amt">${nf0.format(toVND(e))} ₫</div>` : ""}</div>
     <button class="icon-btn" data-e="${e.id}">✎</button><button class="icon-btn" data-d="${e.id}">🗑</button></div>`).join("") : `<div class="empty">No expenses logged.</div>`}</div>`;
   $("#add").onclick = () => openForm("Add expense", expFields(), null, o => { S.expenses.push({ id: uid(), ...o }); save(); render(); });
   el.onclick = e => {
@@ -407,7 +602,8 @@ function render() {
 }
 window.addEventListener("hashchange", () => { const t = location.hash.slice(1); if (TABS.some(x => x[0] === t) && t !== tab) { tab = t; render(); } });
 render();
-if (!S.settings.start && !localStorage.getItem(KEY + "-welcomed")) { try { localStorage.setItem(KEY + "-welcomed", "1"); } catch {} openSettings(); }
+if (sb) initCloud();
+else if (!S.settings.start && !localStorage.getItem(KEY + "-welcomed")) { try { localStorage.setItem(KEY + "-welcomed", "1"); } catch {} openSettings(); }
 if ("serviceWorker" in navigator && location.protocol.startsWith("http")) navigator.serviceWorker.register("sw.js").catch(() => {});
 </script>
 </body>
