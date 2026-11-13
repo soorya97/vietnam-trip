@@ -25,12 +25,24 @@ body{font:15px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;backgro
   padding-bottom:calc(76px + env(safe-area-inset-bottom))}
 header.top{background:linear-gradient(135deg,var(--accent),#0b6f86 60%,#134e6f);color:#fff;
   padding:calc(18px + env(safe-area-inset-top)) 20px 64px}
-.top-in{max-width:960px;margin:0 auto;display:flex;align-items:flex-start;justify-content:space-between;gap:12px}
+.top-in{max-width:1120px;margin:0 auto;display:flex;align-items:flex-start;justify-content:space-between;gap:12px}
 .top h1{margin:0;font-size:22px;letter-spacing:-.01em}
 .top .sub{opacity:.85;font-size:13px;margin-top:2px}
 .chip{background:rgba(255,255,255,.18);border:1px solid rgba(255,255,255,.3);color:#fff;border-radius:999px;
   padding:8px 14px;font-size:13px;cursor:pointer;white-space:nowrap}
-main{max-width:960px;margin:-44px auto 0;padding:0 16px}
+main{max-width:1120px;margin:-44px auto 0;padding:0 16px}
+.cols{display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(300px,1fr))}
+.cols>.card{margin-bottom:0}
+.split{display:grid;gap:14px;align-items:start}
+.split>div>.card:last-child{margin-bottom:0}
+main.narrow>.card{max-width:780px;margin-left:auto;margin-right:auto}
+@media(min-width:900px){
+  .split{grid-template-columns:minmax(300px,380px) 1fr}
+  .split>:first-child{position:sticky;top:64px}
+  .top h1{font-size:28px}
+  header.top{padding-bottom:28px}
+}
+@media(min-width:900px){ .grid{gap:16px} .stat .v{font-size:26px} }
 nav.tabs{position:fixed;left:0;right:0;bottom:0;z-index:20;background:var(--card);border-top:1px solid var(--line);
   display:flex;justify-content:space-around;padding:6px 4px calc(6px + env(safe-area-inset-bottom))}
 nav.tabs button{flex:1;background:none;border:0;color:var(--muted);font:inherit;font-size:11px;padding:6px 2px;
@@ -42,7 +54,8 @@ nav.tabs button.on{color:var(--accent);font-weight:600}
   nav.tabs{position:sticky;top:0;bottom:auto;border:0;border-bottom:1px solid var(--line);justify-content:center;gap:4px;padding:6px}
   nav.tabs button{flex:0 0 auto;flex-direction:row;font-size:14px;padding:9px 16px;gap:8px}
   nav.tabs button.on{background:color-mix(in srgb,var(--accent) 14%,transparent)}
-  main{margin-top:-40px}
+  main{margin-top:20px}
+  header.top{padding-bottom:28px}
 }
 .card{background:var(--card);border-radius:var(--r);box-shadow:var(--shadow);padding:18px;margin-bottom:14px}
 .card h2{margin:0 0 12px;font-size:16px}
@@ -117,7 +130,7 @@ const nf0 = new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 });
 const nf2 = new Intl.NumberFormat("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const inr = new Intl.NumberFormat("en-IN", { maximumFractionDigits: 2 });
 const fmtCur = (c, n) => c === "INR" ? "₹" + inr.format(n) : nf2.format(n) + " " + c;
-const fmtHome = n => fmtCur(S.settings.homeCur, n);
+const fmtHome = n => S.settings.homeCur === "INR" ? "₹" + new Intl.NumberFormat("en-IN", { maximumFractionDigits: 0 }).format(n) : fmtCur(S.settings.homeCur, n);
 const fmtDate = (d, o = { weekday: "short", day: "numeric", month: "short" }) =>
   d ? new Date(d + "T00:00").toLocaleDateString("en-GB", o) : "";
 function toast(msg) {
@@ -377,7 +390,7 @@ function openSettings() {
     { k: "p1", label: "Traveller 1", half: 1 }, { k: "p2", label: "Traveller 2", half: 1 },
     { k: "homeCur", label: "Home currency code", half: 1, ph: "USD / INR / EUR" },
     { k: "rate", label: "1 home unit = ? VND", type: "number", half: 1 },
-    { k: "budget", label: "Total budget (VND, 0 = none)", type: "number" }
+    { k: "budget", label: "Total budget in your home currency (0 = none)", type: "number" }
   ], s, o => { S.settings = { ...s, ...o, homeCur: (o.homeCur || "USD").toUpperCase(), rate: o.rate || s.rate }; save(); render(); },
   `<button type="button" class="btn ghost sm" id="bk">Backup / restore</button>`);
   $("#bk").onclick = () => { $("#dlg").close(); backupDialog(); };
@@ -406,12 +419,13 @@ function backupDialog() {
 }
 
 /* ---------- overview ---------- */
-function totalVND() { return S.expenses.reduce((a, e) => a + toVND(e), 0); }
-const toVND = e => e.cur === "VND" ? e.amount : e.amount * S.settings.rate;
+// All totals are shown in the home currency (INR); VND entries are converted at the saved rate.
+function totalHome() { return S.expenses.reduce((a, e) => a + toHome(e), 0); }
+const toHome = e => e.cur === "VND" ? e.amount / S.settings.rate : e.amount;
 function balance() {
   let p1 = 0, p2 = 0;
   S.expenses.forEach(e => {
-    const v = toVND(e);
+    const v = toHome(e);
     if (e.paidBy === "p1") p1 += v; else p2 += v;
     const owe1 = e.forWho === "p1" ? v : e.forWho === "p2" ? 0 : v / 2;
     p1 -= owe1; p2 -= (v - owe1);
@@ -421,10 +435,10 @@ function balance() {
 function balanceText() {
   const b = balance(), s = S.settings;
   if (Math.abs(b) < 1) return "All square";
-  return b > 0 ? `${s.p2} owes ${s.p1} ${nf0.format(b)} ₫` : `${s.p1} owes ${s.p2} ${nf0.format(-b)} ₫`;
+  return b > 0 ? `${esc(s.p2)} owes ${esc(s.p1)} ${esc(fmtHome(b))}` : `${esc(s.p1)} owes ${esc(s.p2)} ${esc(fmtHome(-b))}`;
 }
 function vOverview(el) {
-  const s = S.settings, spent = totalVND(), d = daysTo(s.start);
+  const s = S.settings, spent = totalHome(), d = daysTo(s.start);
   const openTodos = S.todos.filter(t => !t.done).length, packed = S.packing.filter(t => t.done).length;
   const now = new Date().toISOString();
   const next = [...S.itinerary].sort(byDT).find(i => (i.date + "T" + (i.time || "00:00")) >= now.slice(0, 16));
@@ -432,17 +446,18 @@ function vOverview(el) {
   el.innerHTML = `
   <div class="grid" style="margin-bottom:14px">
     <div class="stat"><div class="k">Countdown</div><div class="v">${d == null ? "—" : d > 0 ? d + " days" : d === 0 ? "Today" : "Travelling"}</div><div class="s">${s.start ? fmtDate(s.start) : "set dates in ⚙"}</div></div>
-    <div class="stat"><div class="k">Spent</div><div class="v">${nf0.format(spent)} ₫</div><div class="s">≈ ${esc(fmtHome(spent / s.rate))}</div></div>
+    <div class="stat"><div class="k">Spent</div><div class="v">${esc(fmtHome(spent))}</div><div class="s">≈ ${nf0.format(spent * s.rate)} ₫ VND</div></div>
     <div class="stat"><div class="k">To-do left</div><div class="v">${openTodos}</div><div class="s">${S.todos.length} total</div></div>
     <div class="stat"><div class="k">Packed</div><div class="v">${packed}/${S.packing.length}</div><div class="s">items</div></div>
   </div>
+  <div class="cols">
   <div class="card"><h2>Next up</h2>${next ? `<div class="row"><div class="time">${esc(next.time || "")}</div><div><div class="t" style="font-weight:600">${esc(next.title)}</div><div class="muted small">${fmtDate(next.date)}${next.place ? " · " + esc(next.place) : ""}</div></div></div>` : `<div class="muted">Nothing planned yet — add stops in the Itinerary tab.</div>`}</div>
   <div class="card"><h2>Budget</h2>${s.budget ? `<div class="bar ${spent > s.budget ? "over" : ""}"><i style="width:${pct}%"></i></div>
-    <div class="row between small muted" style="margin-top:6px"><span>${nf0.format(spent)} ₫ of ${nf0.format(s.budget)} ₫</span><span>${nf0.format(Math.max(0, s.budget - spent))} ₫ left</span></div>` : `<div class="muted">No budget set. <a href="#" id="sb" style="color:var(--accent)">Set one</a></div>`}
+    <div class="row between small muted" style="margin-top:6px"><span>${esc(fmtHome(spent))} of ${esc(fmtHome(s.budget))}</span><span>${esc(fmtHome(Math.max(0, s.budget - spent)))} left</span></div>` : `<div class="muted">No budget set. <a href="#" id="sb" style="color:var(--accent)">Set one</a></div>`}
     <div style="margin-top:12px"><span class="tag w">Balance</span> ${balanceText()}</div></div>
-  <div class="card"><h2>Documents</h2><div class="muted" id="dc">…</div></div>`;
+  <div class="card"><h2>Documents</h2><div class="muted" id="dc">…</div></div></div>`;
   const sb = $("#sb"); if (sb) sb.onclick = e => { e.preventDefault(); openSettings(); };
-  DB.all().then(a => { const x = $("#dc"); if (x) x.textContent = a.length ? `${a.length} document${a.length > 1 ? "s" : ""} stored on this device.` : "No documents yet — upload passports, visas, tickets and bookings."; }).catch(() => {});
+  DB.all().then(a => { const x = $("#dc"); if (x) x.textContent = a.length ? `${a.length} document${a.length > 1 ? "s" : ""} stored.` : "No documents yet — upload passports, visas, tickets and bookings."; }).catch(() => {});
 }
 
 /* ---------- itinerary ---------- */
@@ -481,15 +496,15 @@ async function vDocs(el) {
   try { docs = await DB.all(); } catch { el.innerHTML = `<div class="card">Document storage isn't available in this browser (private mode?).</div>`; return; }
   docs.sort((a, b) => b.added - a.added);
   const shown = docFilter === "All" ? docs : docs.filter(d => d.cat === docFilter);
-  el.innerHTML = `<div class="card"><h2>Travel documents</h2>
-    <p class="muted small" style="margin-top:-6px">🔒 Stored privately in this browser on this device. They are never uploaded anywhere.</p>
+  el.innerHTML = `<div class="split"><div class="card"><h2>Travel documents</h2>
+    <p class="muted small" style="margin-top:-6px">🔒 ${sb ? "Private: saved on this device and in your own private cloud storage, visible only to your two logins." : "Private: stored only in this browser on this device, never uploaded."}</p>
     <div class="two"><label class="f">Category<select id="dcat">${DOC_CATS.map(c => `<option>${c}</option>`).join("")}</select></label>
     <label class="f">For<select id="dwho"><option value="both">Both</option><option value="p1">${esc(S.settings.p1)}</option><option value="p2">${esc(S.settings.p2)}</option></select></label></div>
     <label class="btn" style="display:block;text-align:center;cursor:pointer">+ Add files / photos<input id="dfile" type="file" multiple hidden accept="image/*,application/pdf,.doc,.docx,.txt"></label></div>
-  <div class="card"><div class="pills">${["All", ...DOC_CATS].map(c => `<button class="pill ${c === docFilter ? "on" : ""}" data-f="${c}">${c}${c === "All" ? ` (${docs.length})` : ""}</button>`).join("")}</div>
+  <div class="card" style="margin-bottom:0"><div class="pills">${["All", ...DOC_CATS].map(c => `<button class="pill ${c === docFilter ? "on" : ""}" data-f="${c}">${c}${c === "All" ? ` (${docs.length})` : ""}</button>`).join("")}</div>
   ${shown.length ? shown.map(d => `<div class="item"><div class="thumb" data-th="${d.id}">${d.type.startsWith("image/") ? "🖼" : d.type === "application/pdf" ? "📕" : "📎"}</div>
     <div class="grow"><div class="t">${esc(d.name)}</div><div class="muted small"><span class="tag">${esc(d.cat)}</span><span class="tag w">${esc(person(d.who))}</span>${(d.size / 1024).toFixed(0)} KB${d.blob ? "" : " · ☁ tap ↗ to download"}</div></div>
-    <button class="icon-btn" data-o="${d.id}" title="Open">↗</button><button class="icon-btn" data-x="${d.id}" title="Delete">🗑</button></div>`).join("") : `<div class="empty">Nothing here yet.<br>Add passport scans, e-visa, flight tickets and hotel bookings so they're offline when you need them.</div>`}</div>`;
+    <button class="icon-btn" data-o="${d.id}" title="Open">↗</button><button class="icon-btn" data-x="${d.id}" title="Delete">🗑</button></div>`).join("") : `<div class="empty">Nothing here yet.<br>Add passport scans, e-visa, flight tickets and hotel bookings so they're offline when you need them.</div>`}</div></div>`;
   const map = new Map(docs.map(d => [d.id, d]));
   shown.filter(d => d.blob && d.type.startsWith("image/")).forEach(d => {
     const th = $(`[data-th="${d.id}"]`); if (th) th.innerHTML = `<img alt="" src="${URL.createObjectURL(d.blob)}">`;
@@ -528,7 +543,7 @@ let expFilter = "All";
 const expFields = () => [
   { k: "title", label: "What", req: 1, ph: "Pho & coffee" },
   { k: "amount", label: "Amount", type: "number", req: 1, half: 1 },
-  { k: "cur", label: "Currency", type: "select", half: 1, opts: [["VND", "VND ₫"], [S.settings.homeCur, S.settings.homeCur + (S.settings.homeCur === "INR" ? " ₹" : "")]] },
+  { k: "cur", label: "Currency", type: "select", half: 1, def: S.settings.homeCur, opts: [["VND", "VND ₫"], [S.settings.homeCur, S.settings.homeCur + (S.settings.homeCur === "INR" ? " ₹" : "")]] },
   { k: "date", label: "Date", type: "date", half: 1, def: today() },
   { k: "cat", label: "Category", type: "select", half: 1, opts: EXP_CATS.map(c => [c, c]) },
   { k: "paidBy", label: "Paid by", type: "select", half: 1, opts: [["p1", S.settings.p1], ["p2", S.settings.p2]] },
@@ -536,21 +551,21 @@ const expFields = () => [
 ];
 function vExpenses(el) {
   const list = [...S.expenses].sort((a, b) => b.date.localeCompare(a.date)).filter(e => expFilter === "All" || e.cat === expFilter);
-  const total = totalVND(), by = {};
-  S.expenses.forEach(e => by[e.cat] = (by[e.cat] || 0) + toVND(e));
+  const total = totalHome(), by = {};
+  S.expenses.forEach(e => by[e.cat] = (by[e.cat] || 0) + toHome(e));
   const max = Math.max(1, ...Object.values(by));
-  const paid1 = S.expenses.filter(e => e.paidBy === "p1").reduce((a, e) => a + toVND(e), 0);
-  el.innerHTML = `<div class="grid" style="margin-bottom:14px">
-    <div class="stat"><div class="k">Total</div><div class="v">${nf0.format(total)} ₫</div><div class="s">≈ ${esc(fmtHome(total / S.settings.rate))}</div></div>
-    <div class="stat"><div class="k">Balance</div><div class="v" style="font-size:15px;margin-top:6px">${balanceText()}</div><div class="s">${esc(S.settings.p1)} paid ${nf0.format(paid1)} ₫</div></div></div>
+  const paid1 = S.expenses.filter(e => e.paidBy === "p1").reduce((a, e) => a + toHome(e), 0);
+  el.innerHTML = `<div class="split"><div><div class="grid" style="margin-bottom:14px">
+    <div class="stat"><div class="k">Total</div><div class="v">${esc(fmtHome(total))}</div><div class="s">≈ ${nf0.format(total * S.settings.rate)} ₫ VND</div></div>
+    <div class="stat"><div class="k">Balance</div><div class="v" style="font-size:15px;margin-top:6px">${balanceText()}</div><div class="s">${esc(S.settings.p1)} paid ${esc(fmtHome(paid1))}</div></div></div>
   ${Object.keys(by).length ? `<div class="card"><h2>By category</h2>${Object.entries(by).sort((a, b) => b[1] - a[1]).map(([c, v]) =>
-    `<div style="margin-bottom:10px"><div class="row between small"><span>${CAT_ICON[c] || ""} ${esc(c)}</span><span>${nf0.format(v)} ₫</span></div><div class="bar"><i style="width:${v / max * 100}%"></i></div></div>`).join("")}</div>` : ""}
-  <div class="card"><div class="row between"><h2 style="margin:0">Expenses</h2><button class="btn" id="add">+ Add</button></div>
+    `<div style="margin-bottom:10px"><div class="row between small"><span>${CAT_ICON[c] || ""} ${esc(c)}</span><span>${esc(fmtHome(v))}</span></div><div class="bar"><i style="width:${v / max * 100}%"></i></div></div>`).join("")}</div>` : ""}</div>
+  <div class="card" style="margin-bottom:0"><div class="row between"><h2 style="margin:0">Expenses</h2><button class="btn" id="add">+ Add</button></div>
   <div class="pills" style="margin-top:12px">${["All", ...EXP_CATS].map(c => `<button class="pill ${c === expFilter ? "on" : ""}" data-f="${c}">${c}</button>`).join("")}</div>
   ${list.length ? list.map(e => `<div class="item"><div class="thumb">${CAT_ICON[e.cat] || "🧾"}</div><div class="grow"><div class="t">${esc(e.title)}</div>
     <div class="muted small">${fmtDate(e.date)} · paid by ${esc(person(e.paidBy))} · ${e.forWho === "both" ? "split" : "only " + esc(person(e.forWho))}</div></div>
-    <div><div class="amt">${e.cur === "VND" ? nf0.format(e.amount) + " ₫" : esc(fmtCur(e.cur, e.amount))}</div>${e.cur !== "VND" ? `<div class="muted small amt">${nf0.format(toVND(e))} ₫</div>` : ""}</div>
-    <button class="icon-btn" data-e="${e.id}">✎</button><button class="icon-btn" data-d="${e.id}">🗑</button></div>`).join("") : `<div class="empty">No expenses logged.</div>`}</div>`;
+    <div><div class="amt">${esc(fmtHome(toHome(e)))}</div>${e.cur === "VND" ? `<div class="muted small amt">${nf0.format(e.amount)} ₫</div>` : ""}</div>
+    <button class="icon-btn" data-e="${e.id}">✎</button><button class="icon-btn" data-d="${e.id}">🗑</button></div>`).join("") : `<div class="empty">No expenses logged.</div>`}</div></div>`;
   $("#add").onclick = () => openForm("Add expense", expFields(), null, o => { S.expenses.push({ id: uid(), ...o }); save(); render(); });
   el.onclick = e => {
     const f = e.target.closest("[data-f]"), ed = e.target.closest("[data-e]"), de = e.target.closest("[data-d]");
@@ -597,6 +612,7 @@ function render() {
   drawTabs(); header();
   const el = $("#view");
   el.onclick = el.onchange = null;
+  el.className = ["itinerary", "todo", "packing"].includes(tab) ? "narrow" : "";
   ({ overview: vOverview, itinerary: vItinerary, docs: vDocs, expenses: vExpenses,
      todo: e => vChecklist(e, "todos", "To-do", "Add a task…"), packing: e => vChecklist(e, "packing", "Packing list", "Add an item…") })[tab](el);
 }
