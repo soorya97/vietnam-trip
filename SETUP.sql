@@ -31,4 +31,4 @@ create policy "members only docs" on storage.objects for all to authenticated
   with check (bucket_id = 'docs' and public.is_allowed());
 
 -- Your two logins (must match the users you create under Authentication -> Users):
-insert into public.allowed_users (email) values ('you@example.com'), ('partner@example.com') on conflict do nothing;
+insert into public.allowed_users (email) values ('jayansoorya007@gmail.com'), ('pramilakannan03@gmail.com') on conflict do nothing;
